@@ -1,0 +1,128 @@
+import asyncio
+import threading
+import time
+from queue import Queue
+from bleak import BleakClient, BleakScanner
+
+THROTTLE_UUID = "86c3810e-0010-40d9-a117-26b300768cd6"
+RUDDER_UUID = "86c3810e-0021-40d9-a117-26b300768cd6"
+
+def scale_throttle(val):
+    return int(((1 - val) / 2) * (0xFA - 0x20) + 0x20)
+
+def scale_rudder(val):
+    return int(val * 50)
+
+async def scan_for_powerup():
+    print("Scanning for PowerUp...")
+    devices = await BleakScanner.discover()
+    for d in devices:
+        if d.name and "PowerUp" in d.name:
+            print(f"Found PowerUp at {d.address}")
+            return d.address
+    return None
+
+def sync_scan():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(scan_for_powerup())
+
+async def do_stunt(client, direction):
+    print(f"Performing {'LEFT' if direction < 0 else 'RIGHT'} stunt!")
+    rudder_byte = (256 + direction) if direction < 0 else direction
+    await client.write_gatt_char(RUDDER_UUID, bytearray([rudder_byte]))
+    await client.write_gatt_char(THROTTLE_UUID, bytearray([0xFA]))
+    await asyncio.sleep(0.3)
+    await client.write_gatt_char(RUDDER_UUID, bytearray([0x00]))
+    await asyncio.sleep(0.05)
+
+async def ble_loop(address, throttle_q, rudder_q, stunt_q, shutdown_event):
+    async with BleakClient(address) as client:
+        print("Connected to PowerUp...")
+        throttle = 0x00
+        rudder = 0
+
+        while not shutdown_event.is_set():
+            if not stunt_q.empty():
+                direction = stunt_q.get_nowait()
+                await do_stunt(client, direction)
+                continue
+
+            if not throttle_q.empty():
+                val = throttle_q.get_nowait()
+                if val is not None:
+                    throttle = val
+
+            if not rudder_q.empty():
+                val = rudder_q.get_nowait()
+                if val is not None:
+                    rudder = val
+
+            rudder_byte = rudder if rudder >= 0 else 256 + rudder
+            await client.write_gatt_char(THROTTLE_UUID, bytearray([throttle]))
+            await client.write_gatt_char(RUDDER_UUID, bytearray([rudder_byte]))
+            await asyncio.sleep(0.1)
+
+    print("BLE disconnected. Triggering shutdown...")
+    shutdown_event.set()
+
+def gamepad_loop(throttle_q, rudder_q, stunt_q, shutdown_event):
+    import pygame
+    pygame.init()
+    pygame.joystick.init()
+
+    if pygame.joystick.get_count() == 0:
+        print("No controller detected...")
+        return
+
+    js = pygame.joystick.Joystick(0)
+    js.init()
+    print("Gamepad ready...")
+
+    try:
+        while not shutdown_event.is_set():
+            pygame.event.pump()
+            left_y = js.get_axis(1)
+            right_x = js.get_axis(2)
+
+            throttle_q.put(scale_throttle(left_y))
+            rudder_q.put(scale_rudder(right_x))
+
+            if js.get_button(3):  # Square
+                stunt_q.put(-90)
+                time.sleep(0.2)
+            elif js.get_button(1):  # Circle
+                stunt_q.put(90)
+                time.sleep(0.2)
+
+            time.sleep(0.05)
+    finally:
+        js.quit()
+        pygame.quit()
+        print("Controller shut down cleanly...")
+
+def start_flight_controller():
+    throttle_q = Queue()
+    rudder_q = Queue()
+    stunt_q = Queue()
+    shutdown_event = threading.Event()
+
+    address = sync_scan()
+    if not address:
+        print("No PowerUp found. Exiting...")
+        return
+
+    ble_thread = threading.Thread(
+        target=lambda: asyncio.run(
+            ble_loop(address, throttle_q, rudder_q, stunt_q, shutdown_event)
+        ),
+        daemon=True
+    )
+    ble_thread.start()
+
+    gamepad_loop(throttle_q, rudder_q, stunt_q, shutdown_event)
+    print("Flight session ended...")
+
+# Optional standalone runner
+if __name__ == "__main__":
+    start_flight_controller()
