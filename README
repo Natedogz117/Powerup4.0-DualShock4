@@ -1,0 +1,4 @@
+Be sure to install dependencies, this can be done with:
+pip install -r requirements.txt
+
+Connect you controller to your computer and turn on your Powerup device before starting the script.
